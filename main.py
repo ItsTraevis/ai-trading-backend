@@ -154,6 +154,13 @@ paper = PaperBroker()
 ####################################
 
 BROKERS = {
+    "paper_local": {
+        "name": "Paper Local",
+        "website": "#",
+        "note": "Local paper trading - no real money involved.",
+        "connect_type": "local",
+        "paper": True
+    },
     "topstep": {
         "name": "Topstep",
         "website": "https://www.topstep.com",
@@ -316,6 +323,34 @@ class PlaceTradeOrder(BaseModel):
     live_confirm: bool = False
 
 
+class LearnTradeResult(BaseModel):
+    trade_id: str
+    won: bool
+    profit_loss: float
+
+
+class BacktestRequest(BaseModel):
+    symbol: str
+    candles: list[Candle]
+
+
+# Trade history storage
+TRADES_FILE = "trades.json"
+trade_history = []
+
+def load_trades():
+    global trade_history
+    if os.path.exists(TRADES_FILE):
+        with open(TRADES_FILE, "r") as f:
+            trade_history = json.load(f)
+
+def save_trades():
+    with open(TRADES_FILE, "w") as f:
+        json.dump(trade_history, f, indent=4)
+
+load_trades()
+
+
 ####################################
 # API
 ####################################
@@ -326,9 +361,36 @@ def home():
     return {"status": "running"}
 
 
+@app.get("/dashboard")
+def dashboard():
+    return {
+        "brain": brain.memory,
+        "paper_balance": paper.balance,
+        "open_trades": len(paper.trades),
+        "trade_history_count": len(trade_history),
+        "connected_brokers": len(CONNECTED_BROKERS),
+        "available_brokers": list(BROKERS.keys())
+    }
+
+
 @app.get("/brokers")
 def brokers():
     return BROKERS
+
+
+@app.get("/connections")
+def connections():
+    safe = []
+    for connection_id, broker in CONNECTED_BROKERS.items():
+        safe.append({
+            "connection_id": connection_id,
+            "broker_id": broker["broker_id"],
+            "broker_name": broker["broker_name"],
+            "account_id": broker.get("account_id"),
+            "paper": broker["paper"],
+            "status": broker["status"]
+        })
+    return safe
 
 
 @app.get("/connect/{broker_id}")
@@ -339,8 +401,8 @@ def connect_broker_link(broker_id: str):
     return RedirectResponse(url=broker["website"])
 
 
-@app.post("/attach-broker")
-def attach_broker(keys: BrokerKeys):
+@app.post("/attach-manual-broker")
+def attach_manual_broker(keys: BrokerKeys):
     if keys.broker_id not in BROKERS:
         raise HTTPException(status_code=404, detail="Broker not found")
 
@@ -362,21 +424,6 @@ def attach_broker(keys: BrokerKeys):
         "broker": BROKERS[keys.broker_id]["name"],
         "paper_mode": keys.paper
     }
-
-
-@app.get("/connected-brokers")
-def connected_brokers():
-    safe = []
-    for connection_id, broker in CONNECTED_BROKERS.items():
-        safe.append({
-            "connection_id": connection_id,
-            "broker_id": broker["broker_id"],
-            "broker_name": broker["broker_name"],
-            "account_id": broker.get("account_id"),
-            "paper": broker["paper"],
-            "status": broker["status"]
-        })
-    return safe
 
 
 @app.post("/connect-tradovate")
@@ -478,8 +525,8 @@ def memory():
     return brain.memory
 
 
-@app.post("/analyze")
-def analyze(market: Market):
+@app.post("/analyze-market")
+def analyze_market(market: Market):
     candles = [x.dict() for x in market.candles]
     signal = strategy(market.symbol, candles)
     decision = brain.approve(signal)
@@ -489,14 +536,14 @@ def analyze(market: Market):
     }
 
 
-@app.post("/auto-trade")
-def trade(market: Market):
+@app.post("/ai-trade")
+def ai_trade(market: Market):
     candles = [x.dict() for x in market.candles]
     signal = strategy(market.symbol, candles)
     decision = brain.approve(signal)
 
     if not decision["approved"]:
-        return {"status": "NO"}
+        return {"status": "NO_TRADE", "signal": signal, "decision": decision}
 
     broker = BROKERS[market.broker]
 
@@ -506,7 +553,7 @@ def trade(market: Market):
             "reason": "Live disabled"
         }
 
-    trade = paper.place_trade(
+    paper_trade = paper.place_trade(
         market.symbol,
         signal["action"],
         signal["entry"],
@@ -514,12 +561,111 @@ def trade(market: Market):
         signal["take_profit"]
     )
 
+    # Save to trade history
+    trade_record = {
+        "trade_id": paper_trade["id"],
+        "created_at": paper_trade["time"],
+        "symbol": market.symbol,
+        "broker": market.broker,
+        "setup": signal.get("setup"),
+        "side": signal["action"],
+        "entry": signal["entry"],
+        "stop_loss": signal["stop_loss"],
+        "take_profit": signal["take_profit"],
+        "confidence": signal.get("confidence"),
+        "decision": decision,
+        "learned": False,
+        "won": None,
+        "profit_loss": None,
+    }
+    trade_history.append(trade_record)
+    save_trades()
+
     return {
         "status": "PLACED",
-        "trade": trade
+        "trade": paper_trade,
+        "signal": signal,
+        "decision": decision
     }
 
 
 @app.post("/learn")
 def learn(result: Learn):
     return brain.learn(result.setup, result.won, result.pnl)
+
+
+@app.get("/trades")
+def get_trades():
+    return trade_history
+
+
+@app.post("/learn-trade")
+def learn_trade(result: LearnTradeResult):
+    global trade_history
+    
+    for trade in trade_history:
+        if trade["trade_id"] == result.trade_id:
+            if trade.get("learned"):
+                return {"status": "already_learned", "trade_id": result.trade_id}
+            
+            trade["won"] = result.won
+            trade["profit_loss"] = result.profit_loss
+            trade["learned"] = True
+            
+            # Update AI brain
+            if trade.get("setup"):
+                brain.learn(trade["setup"], result.won, result.profit_loss)
+            
+            save_trades()
+            return {"status": "learned", "trade": trade}
+    
+    raise HTTPException(status_code=404, detail="Trade not found")
+
+
+@app.post("/backtest")
+def backtest(req: BacktestRequest):
+    candles = [c.dict() for c in req.candles]
+    if len(candles) < 50:
+        raise HTTPException(status_code=400, detail="Need at least 50 candles for backtest")
+    
+    results = {
+        "total_signals": 0,
+        "buys": 0,
+        "sells": 0,
+        "waits": 0,
+        "signals": []
+    }
+    
+    for i in range(20, len(candles)):
+        signal = strategy(req.symbol, candles[:i+1])
+        if signal["action"] != "WAIT":
+            results["total_signals"] += 1
+            results["signals"].append({
+                "index": i,
+                "time": candles[i]["time"],
+                **signal
+            })
+            if signal["action"] == "BUY":
+                results["buys"] += 1
+            else:
+                results["sells"] += 1
+        else:
+            results["waits"] += 1
+    
+    return results
+
+
+@app.post("/reset-paper-data")
+def reset_paper_data():
+    global trade_history
+    
+    brain.memory = DEFAULT_MEMORY.copy()
+    brain.save()
+    
+    trade_history = []
+    save_trades()
+    
+    paper.balance = 50000
+    paper.trades = []
+    
+    return {"status": "reset_complete"}
