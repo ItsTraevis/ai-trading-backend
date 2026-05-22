@@ -1,11 +1,21 @@
 # backend/main.py
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from strategy import analyze_market
 from learning_engine import update_learning_score
 from paper_broker import PaperBroker
 
 app = FastAPI(title="AI Trading Learning API")
+
+# Enable CORS for frontend
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 paper_broker = PaperBroker(starting_balance=50000)
 
