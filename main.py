@@ -1,10 +1,10 @@
-# backend/main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from strategy import analyze_market
-from learning_engine import update_learning_score
-from paper_broker import PaperBroker
+import json
+import os
+import uuid
+from datetime import datetime
 
 app = FastAPI(title="AI Trading Learning API")
 
@@ -17,7 +17,217 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-paper_broker = PaperBroker(starting_balance=50000)
+####################################
+# MEMORY
+####################################
+
+MEMORY_FILE = "ai_memory.json"
+
+DEFAULT_MEMORY = {
+    "total_trades": 0,
+    "wins": 0,
+    "losses": 0,
+    "net_profit_loss": 0,
+    "setups": {}
+}
+
+
+class AIBrain:
+    def __init__(self):
+        self.memory = self.load()
+
+    def load(self):
+        if not os.path.exists(MEMORY_FILE):
+            return DEFAULT_MEMORY.copy()
+        with open(MEMORY_FILE, "r") as f:
+            return json.load(f)
+
+    def save(self):
+        with open(MEMORY_FILE, "w") as f:
+            json.dump(self.memory, f, indent=4)
+
+    def setup(self, name):
+        if name not in self.memory["setups"]:
+            self.memory["setups"][name] = {
+                "trades": 0,
+                "wins": 0,
+                "losses": 0,
+                "profit": 0,
+                "bonus": 0
+            }
+        return self.memory["setups"][name]
+
+    def approve(self, signal):
+        if signal["action"] == "WAIT":
+            return {
+                "approved": False,
+                "reason": "No trade"
+            }
+
+        setup = self.setup(signal["setup"])
+        confidence = signal["confidence"] + setup["bonus"]
+
+        if setup["trades"] < 20:
+            return {
+                "approved": True,
+                "mode": "LEARNING",
+                "confidence": confidence
+            }
+
+        winrate = 0
+        if setup["trades"]:
+            winrate = setup["wins"] / setup["trades"]
+
+        if confidence >= 0.65 and winrate >= 0.55:
+            return {
+                "approved": True,
+                "mode": "PROVEN"
+            }
+
+        return {
+            "approved": False,
+            "reason": "Stats weak"
+        }
+
+    def learn(self, setup, won, pnl):
+        s = self.setup(setup)
+
+        self.memory["total_trades"] += 1
+        self.memory["net_profit_loss"] += pnl
+
+        s["trades"] += 1
+        s["profit"] += pnl
+
+        if won:
+            s["wins"] += 1
+            self.memory["wins"] += 1
+            s["bonus"] = min(.15, s["bonus"] + .02)
+        else:
+            s["losses"] += 1
+            self.memory["losses"] += 1
+            s["bonus"] = max(-.25, s["bonus"] - .03)
+
+        self.save()
+
+        return {
+            "status": "learned",
+            "memory": self.memory
+        }
+
+
+brain = AIBrain()
+
+####################################
+# PAPER BROKER
+####################################
+
+
+class PaperBroker:
+    def __init__(self):
+        self.balance = 50000
+        self.trades = []
+
+    def place_trade(self, symbol, side, entry, sl, tp, risk=.5):
+        dollars = self.balance * (risk / 100)
+
+        trade = {
+            "id": str(uuid.uuid4()),
+            "symbol": symbol,
+            "side": side,
+            "entry": entry,
+            "stop": sl,
+            "target": tp,
+            "risk_dollars": round(dollars, 2),
+            "time": datetime.utcnow().isoformat()
+        }
+
+        self.trades.append(trade)
+        return trade
+
+
+paper = PaperBroker()
+
+####################################
+# BROKERS
+####################################
+
+BROKERS = {
+    "tradovate_demo": {"paper": True},
+    "alpaca_paper": {"paper": True},
+    "future_live": {"paper": False}
+}
+
+####################################
+# STRATEGY
+####################################
+
+
+def bullish_displacement(current, previous):
+    current_body = abs(current["close"] - current["open"])
+    previous_body = abs(previous["close"] - previous["open"])
+    return (
+        current["close"] > current["open"]
+        and current_body > previous_body * 1.8
+    )
+
+
+def bearish_displacement(current, previous):
+    current_body = abs(current["close"] - current["open"])
+    previous_body = abs(previous["close"] - previous["open"])
+    return (
+        current["close"] < current["open"]
+        and current_body > previous_body * 1.8
+    )
+
+
+def liquidity_low(candles, idx):
+    lows = [x["low"] for x in candles[-10:]]
+    return candles[idx]["low"] < min(lows)
+
+
+def liquidity_high(candles, idx):
+    highs = [x["high"] for x in candles[-10:]]
+    return candles[idx]["high"] > max(highs)
+
+
+def strategy(symbol, candles):
+    if len(candles) < 20:
+        return {"action": "WAIT"}
+
+    current = candles[-1]
+    previous = candles[-2]
+
+    if liquidity_low(candles, -1) and bullish_displacement(current, previous):
+        return {
+            "setup": "Liquidity+BullishDisplacement",
+            "setup_id": str(uuid.uuid4()),
+            "symbol": symbol,
+            "action": "BUY",
+            "entry": current["close"],
+            "stop_loss": current["low"],
+            "take_profit": current["close"] + (current["close"] - current["low"]) * 2,
+            "confidence": .65
+        }
+
+    if liquidity_high(candles, -1) and bearish_displacement(current, previous):
+        return {
+            "setup": "Liquidity+BearishDisplacement",
+            "setup_id": str(uuid.uuid4()),
+            "symbol": symbol,
+            "action": "SELL",
+            "entry": current["close"],
+            "stop_loss": current["high"],
+            "take_profit": current["close"] - (current["high"] - current["close"]) * 2,
+            "confidence": .65
+        }
+
+    return {"action": "WAIT"}
+
+
+####################################
+# MODELS
+####################################
+
 
 class Candle(BaseModel):
     time: str
@@ -25,50 +235,82 @@ class Candle(BaseModel):
     high: float
     low: float
     close: float
-    volume: float = 0
 
-class MarketRequest(BaseModel):
+
+class Market(BaseModel):
     symbol: str
+    broker: str = "tradovate_demo"
     candles: list[Candle]
 
-class TradeFeedback(BaseModel):
-    setup_id: str
+
+class Learn(BaseModel):
+    setup: str
     won: bool
-    profit_loss: float
+    pnl: float
+
+
+####################################
+# API
+####################################
+
 
 @app.get("/")
 def home():
-    return {"status": "AI Trading API is running"}
+    return {"status": "running"}
+
+
+@app.get("/brokers")
+def brokers():
+    return BROKERS
+
+
+@app.get("/memory")
+def memory():
+    return brain.memory
+
 
 @app.post("/analyze")
-def analyze(request: MarketRequest):
-    candles = [c.dict() for c in request.candles]
-    signal = analyze_market(request.symbol, candles)
-    return signal
+def analyze(market: Market):
+    candles = [x.dict() for x in market.candles]
+    signal = strategy(market.symbol, candles)
+    decision = brain.approve(signal)
+    return {
+        "signal": signal,
+        "decision": decision
+    }
 
-@app.post("/paper-trade")
-def paper_trade(request: MarketRequest):
-    candles = [c.dict() for c in request.candles]
-    signal = analyze_market(request.symbol, candles)
 
-    if signal["action"] in ["BUY", "SELL"]:
-        trade = paper_broker.place_trade(
-            symbol=request.symbol,
-            side=signal["action"],
-            entry=signal["entry"],
-            stop_loss=signal["stop_loss"],
-            take_profit=signal["take_profit"],
-            risk_percent=1
-        )
-        return {"signal": signal, "paper_trade": trade}
+@app.post("/auto-trade")
+def trade(market: Market):
+    candles = [x.dict() for x in market.candles]
+    signal = strategy(market.symbol, candles)
+    decision = brain.approve(signal)
 
-    return {"signal": signal, "paper_trade": None}
+    if not decision["approved"]:
+        return {"status": "NO"}
+
+    broker = BROKERS[market.broker]
+
+    if not broker["paper"]:
+        return {
+            "status": "BLOCKED",
+            "reason": "Live disabled"
+        }
+
+    trade = paper.place_trade(
+        market.symbol,
+        signal["action"],
+        signal["entry"],
+        signal["stop_loss"],
+        signal["take_profit"]
+    )
+
+    return {
+        "status": "PLACED",
+        "trade": trade
+    }
+
 
 @app.post("/learn")
-def learn(feedback: TradeFeedback):
-    result = update_learning_score(
-        setup_id=feedback.setup_id,
-        won=feedback.won,
-        profit_loss=feedback.profit_loss
-    )
-    return result
+def learn(result: Learn):
+    return brain.learn(result.setup, result.won, result.pnl)
