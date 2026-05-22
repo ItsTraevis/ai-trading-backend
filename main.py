@@ -1,5 +1,6 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 import json
 import os
@@ -152,10 +153,44 @@ paper = PaperBroker()
 ####################################
 
 BROKERS = {
-    "tradovate_demo": {"paper": True},
-    "alpaca_paper": {"paper": True},
-    "future_live": {"paper": False}
+    "topstep": {
+        "name": "Topstep",
+        "website": "https://www.topstep.com",
+        "note": "Topstep connects through platforms like Tradovate or NinjaTrader.",
+        "connect_type": "platform_redirect",
+        "paper": True
+    },
+    "lucid": {
+        "name": "Lucid Trading",
+        "website": "https://lucidtrading.com",
+        "note": "Use only if they provide an official API connection.",
+        "connect_type": "manual_api",
+        "paper": True
+    },
+    "tradovate_demo": {
+        "name": "Tradovate Demo",
+        "website": "https://demo.tradovateapi.com",
+        "note": "Good for futures demo/paper trading.",
+        "connect_type": "api_key",
+        "paper": True
+    },
+    "alpaca_paper": {
+        "name": "Alpaca Paper",
+        "website": "https://app.alpaca.markets/paper/dashboard/overview",
+        "note": "Good for stock/crypto paper trading.",
+        "connect_type": "api_key",
+        "paper": True
+    },
+    "future_live": {
+        "name": "Live Trading",
+        "website": "#",
+        "note": "Live trading - use with caution.",
+        "connect_type": "api_key",
+        "paper": False
+    }
 }
+
+CONNECTED_BROKERS = {}
 
 ####################################
 # STRATEGY
@@ -249,6 +284,14 @@ class Learn(BaseModel):
     pnl: float
 
 
+class BrokerKeys(BaseModel):
+    broker_id: str
+    api_key: str
+    api_secret: str
+    account_id: str | None = None
+    paper: bool = True
+
+
 ####################################
 # API
 ####################################
@@ -262,6 +305,54 @@ def home():
 @app.get("/brokers")
 def brokers():
     return BROKERS
+
+
+@app.get("/connect/{broker_id}")
+def connect_broker_link(broker_id: str):
+    if broker_id not in BROKERS:
+        raise HTTPException(status_code=404, detail="Broker not found")
+    broker = BROKERS[broker_id]
+    return RedirectResponse(url=broker["website"])
+
+
+@app.post("/attach-broker")
+def attach_broker(keys: BrokerKeys):
+    if keys.broker_id not in BROKERS:
+        raise HTTPException(status_code=404, detail="Broker not found")
+
+    connection_id = str(uuid.uuid4())
+
+    CONNECTED_BROKERS[connection_id] = {
+        "broker_id": keys.broker_id,
+        "broker_name": BROKERS[keys.broker_id]["name"],
+        "api_key": keys.api_key,
+        "api_secret": keys.api_secret,
+        "account_id": keys.account_id,
+        "paper": keys.paper,
+        "status": "connected"
+    }
+
+    return {
+        "status": "broker_attached",
+        "connection_id": connection_id,
+        "broker": BROKERS[keys.broker_id]["name"],
+        "paper_mode": keys.paper
+    }
+
+
+@app.get("/connected-brokers")
+def connected_brokers():
+    safe = []
+    for connection_id, broker in CONNECTED_BROKERS.items():
+        safe.append({
+            "connection_id": connection_id,
+            "broker_id": broker["broker_id"],
+            "broker_name": broker["broker_name"],
+            "account_id": broker["account_id"],
+            "paper": broker["paper"],
+            "status": broker["status"]
+        })
+    return safe
 
 
 @app.get("/memory")
