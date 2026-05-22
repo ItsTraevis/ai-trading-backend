@@ -5,6 +5,7 @@ from pydantic import BaseModel
 import json
 import os
 import uuid
+import requests
 from datetime import datetime
 
 app = FastAPI(title="AI Trading Learning API")
@@ -171,8 +172,19 @@ BROKERS = {
         "name": "Tradovate Demo",
         "website": "https://demo.tradovateapi.com",
         "note": "Good for futures demo/paper trading.",
-        "connect_type": "api_key",
+        "connect_type": "tradovate",
+        "auth_url": "https://demo.tradovateapi.com/v1/auth/accesstokenrequest",
+        "order_url": "https://demo.tradovateapi.com/v1/order/placeorder",
         "paper": True
+    },
+    "tradovate_live": {
+        "name": "Tradovate Live",
+        "website": "https://live.tradovateapi.com",
+        "note": "Live futures trading - use with caution!",
+        "connect_type": "tradovate",
+        "auth_url": "https://live.tradovateapi.com/v1/auth/accesstokenrequest",
+        "order_url": "https://live.tradovateapi.com/v1/order/placeorder",
+        "paper": False
     },
     "alpaca_paper": {
         "name": "Alpaca Paper",
@@ -180,13 +192,6 @@ BROKERS = {
         "note": "Good for stock/crypto paper trading.",
         "connect_type": "api_key",
         "paper": True
-    },
-    "future_live": {
-        "name": "Live Trading",
-        "website": "#",
-        "note": "Live trading - use with caution.",
-        "connect_type": "api_key",
-        "paper": False
     }
 }
 
@@ -292,6 +297,25 @@ class BrokerKeys(BaseModel):
     paper: bool = True
 
 
+class TradovateLogin(BaseModel):
+    username: str
+    password: str
+    app_id: str = "AITrader"
+    app_version: str = "1.0"
+    cid: int
+    secret: str
+    demo: bool = True
+
+
+class PlaceTradeOrder(BaseModel):
+    connection_id: str
+    account_id: int
+    symbol: str
+    side: str
+    quantity: int
+    live_confirm: bool = False
+
+
 ####################################
 # API
 ####################################
@@ -348,11 +372,105 @@ def connected_brokers():
             "connection_id": connection_id,
             "broker_id": broker["broker_id"],
             "broker_name": broker["broker_name"],
-            "account_id": broker["account_id"],
+            "account_id": broker.get("account_id"),
             "paper": broker["paper"],
             "status": broker["status"]
         })
     return safe
+
+
+@app.post("/connect-tradovate")
+def connect_tradovate(login: TradovateLogin):
+    broker_id = "tradovate_demo" if login.demo else "tradovate_live"
+    broker = BROKERS[broker_id]
+
+    payload = {
+        "name": login.username,
+        "password": login.password,
+        "appId": login.app_id,
+        "appVersion": login.app_version,
+        "cid": login.cid,
+        "sec": login.secret
+    }
+
+    try:
+        response = requests.post(broker["auth_url"], json=payload, timeout=10)
+        data = response.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Connection failed: {str(e)}")
+
+    if "accessToken" not in data:
+        raise HTTPException(status_code=401, detail=data)
+
+    connection_id = str(uuid.uuid4())
+
+    CONNECTED_BROKERS[connection_id] = {
+        "broker_id": broker_id,
+        "broker_name": broker["name"],
+        "access_token": data["accessToken"],
+        "paper": login.demo,
+        "status": "connected"
+    }
+
+    return {
+        "status": "connected",
+        "connection_id": connection_id,
+        "broker": broker["name"],
+        "demo": login.demo
+    }
+
+
+@app.post("/place-trade")
+def place_trade_order(order: PlaceTradeOrder):
+    if order.connection_id not in CONNECTED_BROKERS:
+        raise HTTPException(status_code=404, detail="Broker not connected")
+
+    connection = CONNECTED_BROKERS[order.connection_id]
+    broker = BROKERS[connection["broker_id"]]
+
+    # Safety check for live trading
+    if connection["paper"] is False and order.live_confirm is not True:
+        return {
+            "status": "blocked",
+            "reason": "Live trading blocked. Set live_confirm=true only when ready."
+        }
+
+    action = order.side.upper()
+    if action not in ["BUY", "SELL"]:
+        raise HTTPException(status_code=400, detail="side must be BUY or SELL")
+
+    tradovate_action = "Buy" if action == "BUY" else "Sell"
+
+    payload = {
+        "accountSpec": str(order.account_id),
+        "accountId": order.account_id,
+        "action": tradovate_action,
+        "symbol": order.symbol,
+        "orderQty": order.quantity,
+        "orderType": "Market",
+        "isAutomated": True
+    }
+
+    headers = {
+        "Authorization": f"Bearer {connection['access_token']}"
+    }
+
+    try:
+        response = requests.post(
+            broker["order_url"],
+            json=payload,
+            headers=headers,
+            timeout=10
+        )
+        result = response.json()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Order failed: {str(e)}")
+
+    return {
+        "status": "order_sent",
+        "broker": connection["broker_name"],
+        "response": result
+    }
 
 
 @app.get("/memory")
